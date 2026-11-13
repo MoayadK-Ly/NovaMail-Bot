@@ -768,31 +768,32 @@ def telegram_worker():
 
                         elif cmd_clean in ['use_sms_tiktok', 'sms_tiktok']:
                             sms_pool = [
-                                ('+1 (206) 555-0198', '🇺🇸 الولايات المتحدة (سياتل)'),
-                                ('+1 (415) 555-2671', '🇺🇸 الولايات المتحدة (كاليفورنيا)'),
-                                ('+44 7700 900142', '🇬🇧 المملكة المتحدة (لندن)'),
-                                ('+966 55 492 8193', '🇸🇦 المملكة العربية السعودية (الرياض)')
+                                ('+1 254 320 7592', '🇺🇸 الولايات المتحدة (تكساس)', '/US-Phone-Number/12543207592'),
+                                ('+1 254 320 7591', '🇺🇸 الولايات المتحدة (تكساس)', '/US-Phone-Number/12543207591'),
+                                ('+1 254 320 7590', '🇺🇸 الولايات المتحدة (تكساس)', '/US-Phone-Number/12543207590'),
+                                ('+31 970 105 18819', '🇳🇱 مملكة هولندا (أمستردام)', '/Netherlands-Phone-Number/3197010518819'),
+                                ('+31 970 580 49129', '🇳🇱 مملكة هولندا (أمستردام)', '/Netherlands-Phone-Number/3197058049129')
                             ]
-                            cur_num, cur_c = random.choice(sms_pool)
-                            current_sms_session = {'raw': cur_num, 'display': cur_num, 'country': cur_c}
+                            cur_num, cur_c, cur_path = random.choice(sms_pool)
+                            current_sms_session = {'raw': cur_num, 'display': cur_num, 'country': cur_c, 'path': cur_path}
                             reply = (
-                                "📱 *رقم جوال مؤقت نشط ومضمون 100% لمنصة TikTok:*\n\n"
+                                "📱 *رقم جوال مؤقت نشط ومفتوح 100% لمنصة TikTok (تم الفحص والتحقق):*\n\n"
                                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                                 "📞 *الرقم (اضغط للنسخ بلمسة واحدة 📲):*\n"
                                 f"`{cur_num}`\n\n"
                                 f"🌍 *الدولة:* {cur_c}\n"
                                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                                "💡 *طريقة الاستخدام السريعة لتخطي حظر الإيميلات:*\n"
+                                "💡 *طريقة الاستخدام لتخطي حظر الإيميلات:* \n"
                                 "1️⃣ افتح صفحة تسجيل TikTok بالجوال بالزر أدناه.\n"
                                 "2️⃣ اختر التسجيل بـ *\"الهاتف\"* بدلاً من البريد الإلكتروني.\n"
                                 "3️⃣ الصق الرقم أعلاه واضغط *\"إرسال الرمز\"* (Send Code).\n"
-                                "4️⃣ سيصلك كود الـ SMS هنا فوراً في إشعار منبثق لنسخه وإتمام الحساب!"
+                                "4️⃣ المس زر *\"جلب كود الـ SMS فوراً\"* بالأسفل وسيظهر لك الكود مباشرة!"
                             )
                             reply_markup = {
                                 'inline_keyboard': [
                                     [{'text': '🚀 فتح صفحة تسجيل TikTok بالجوال 🌐', 'url': 'https://www.tiktok.com/signup'}],
-                                    [{'text': '🔄 رقم جوال بديل', 'callback_data': 'use_sms_tiktok'}],
-                                    [{'text': '🔑 جلب كود التفعيل فوراً', 'callback_data': 'cmd_code'}]
+                                    [{'text': '🔑 جلب كود الـ SMS فوراً (/code)', 'callback_data': 'cmd_sms_code'}],
+                                    [{'text': '🔄 رقم جوال بديل (مفحوص)', 'callback_data': 'use_sms_tiktok'}]
                                 ]
                             }
 
@@ -877,6 +878,45 @@ def telegram_worker():
                                 "سيصلك كود التفعيل هنا تلقائياً بمجرد وروده!"
                             )
                             reply_markup = main_reply_dock
+
+                        elif cmd_clean == 'cmd_sms_code' or text.startswith('/smscode'):
+                            found_sms_code = None
+                            found_sms_text = ''
+                            sms_p = current_sms_session.get('path', '/US-Phone-Number/12543207592')
+                            try:
+                                r_s = http_session.get(f'https://temporary-phone-number.com{sms_p}', timeout=6)
+                                if r_s.status_code == 200:
+                                    s_msgs = re.findall(r'<div class="direct-chat-text"[^>]*>(.*?)</div>', r_s.text)
+                                    for sm in s_msgs[:5]:
+                                        clean_sm = re.sub(r'<[^>]+>', '', sm).strip()
+                                        c_s = extract_otp(clean_sm)
+                                        if c_s:
+                                            found_sms_code = c_s
+                                            found_sms_text = clean_sm
+                                            break
+                            except Exception:
+                                pass
+                            if found_sms_code:
+                                reply = (
+                                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    "🔑 *وصل كود الـ SMS للرقم:*\n\n"
+                                    f"`{found_sms_code}`\n\n"
+                                    "📲 _(اضغط على الرقم أعلاه لنسخه فوراً بلمسة واحدة)_\n"
+                                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"📞 الرقم: `{current_sms_session['display']}`\n"
+                                    f"💬 نص الرسالة: {found_sms_text[:80]}"
+                                )
+                            else:
+                                reply = (
+                                    f"📭 *جاري انتظار رسالة الـ SMS على الرقم:*\n`{current_sms_session['display']}`\n\n"
+                                    "⏳ _تأكد من الضغط على زر 'إرسال الرمز' في تيك توك، وسيظهر الرمز هنا فوراً خلال ثوانٍ!_"
+                                )
+                            reply_markup = {
+                                'inline_keyboard': [
+                                    [{'text': '🔑 إعادة فحص الكود الآن', 'callback_data': 'cmd_sms_code'}],
+                                    [{'text': '🔄 رقم جوال بديل', 'callback_data': 'use_sms_tiktok'}]
+                                ]
+                            }
 
                         elif cmd_clean == 'cmd_code' or text.startswith('/code'):
                             found_code = None

@@ -228,27 +228,41 @@ def extract_otp(text):
     return None
 
 def create_raw_email(custom_name=None):
+    # Primary: Mail.tm real verified accounts
+    for attempt in range(2):
+        try:
+            r_dom = http_session.get('https://api.mail.tm/domains', timeout=5)
+            if r_dom.status_code == 200:
+                doms = r_dom.json().get('hydra:member', [])
+                if doms:
+                    dom_name = doms[0]['domain']
+                    user = (custom_name or 'nova') + '_' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                    email_addr = f"{user}@{dom_name}"
+                    pw = 'Pass@' + str(random.randint(10000, 99999))
+                    r_acc = http_session.post('https://api.mail.tm/accounts', json={'address': email_addr, 'password': pw}, timeout=5)
+                    if r_acc.status_code in (200, 201):
+                        r_tok = http_session.post('https://api.mail.tm/token', json={'address': email_addr, 'password': pw}, timeout=5)
+                        if r_tok.status_code == 200:
+                            tok = r_tok.json().get('token')
+                            return {'email': email_addr, 'password': pw, 'token': tok, 'provider': 'mailtm'}
+        except Exception:
+            pass
+
+    # Secondary Bulletproof Fallback: GuerrillaMail real API
     try:
-        r_dom = http_session.get('https://api.mail.tm/domains', timeout=5)
-        if r_dom.status_code == 200:
-            doms = r_dom.json().get('hydra:member', [])
-            if doms:
-                dom_name = doms[0]['domain']
-                user = custom_name or ('nova_' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8)))
-                email_addr = f"{user}@{dom_name}"
-                pw = 'NovaPass@' + str(random.randint(1000, 9999))
-                r_acc = http_session.post('https://api.mail.tm/accounts', json={'address': email_addr, 'password': pw}, timeout=5)
-                if r_acc.status_code in (200, 201):
-                    r_tok = http_session.post('https://api.mail.tm/token', json={'address': email_addr, 'password': pw}, timeout=5)
-                    if r_tok.status_code == 200:
-                        tok = r_tok.json().get('token')
-                        return {'email': email_addr, 'password': pw, 'token': tok, 'provider': 'mailtm'}
+        r_g = http_session.get('https://api.guerrillamail.com/ajax.php?f=get_email_address', timeout=5)
+        if r_g.status_code == 200:
+            g_data = r_g.json()
+            em = g_data.get('email_addr')
+            sid = g_data.get('sid_token')
+            if em and sid:
+                return {'email': em, 'password': 'Pass@' + str(random.randint(10000, 99999)), 'token': sid, 'provider': 'guerrilla'}
     except Exception:
         pass
-    
-    # Fallback to fldubai.com
-    u = custom_name or ('user_' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8)))
-    return {'email': f"{u}@fldubai.com", 'password': 'Pass' + str(random.randint(1000, 9999)), 'token': None, 'provider': 'fldubai'}
+
+    # Extreme safety net retry
+    u = (custom_name or 'user') + '_' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return {'email': f"{u}@fldubai.com", 'password': 'Pass@' + str(random.randint(10000, 99999)), 'token': None, 'provider': 'fldubai'}
 
 def prewarm_worker():
     while True:
@@ -280,6 +294,21 @@ def poll_inbox_worker():
             for em_addr, tok_val in targets[-10:]:
                 if not tok_val:
                     continue
+                # Guerrilla Mail polling
+                if tok_val.isalnum() and len(tok_val) < 40 and not tok_val.startswith('ey'):
+                    try:
+                        r_g = http_session.get(f'https://api.guerrillamail.com/ajax.php?f=check_email&seq=0&sid_token={tok_val}', timeout=5)
+                        if r_g.status_code == 200:
+                            for gm in r_g.json().get('list', []):
+                                g_subj = gm.get('mail_subject', '')
+                                g_body = gm.get('mail_excerpt', '')
+                                g_code = extract_otp(f"{g_subj} {g_body}")
+                                if g_code:
+                                    forward_code_to_tg(g_code, g_subj, em_addr)
+                    except Exception:
+                        pass
+                    continue
+                # Mail.tm polling
                 try:
                     r = http_session.get('https://api.mail.tm/messages', headers={'Authorization': f'Bearer {tok_val}'}, timeout=5)
                     if r.status_code == 200:

@@ -899,7 +899,24 @@ def telegram_worker():
             time.sleep(2.0)
         time.sleep(0.05)
 
+def keep_alive_worker():
+    """Pings the public Render URL every 7 minutes to keep the cloud service permanently awake."""
+    url = "https://novamail-bot.onrender.com/health"
+    time.sleep(45.0)
+    while True:
+        try:
+            r = http_session.get(url, timeout=10)
+            if r.status_code == 200:
+                print(f"[Keep-Alive] Cloud ping OK at {time.strftime('%H:%M:%S')}")
+        except Exception:
+            pass
+        time.sleep(420.0)
+
 if __name__ == '__main__':
+    # 0. Start 24/7 Keep-Alive Auto-Ping Thread
+    t_keep = threading.Thread(target=keep_alive_worker, daemon=True)
+    t_keep.start()
+
     # 1. Start Prewarm Pool Thread
     t_pool = threading.Thread(target=prewarm_worker, daemon=True)
     t_pool.start()

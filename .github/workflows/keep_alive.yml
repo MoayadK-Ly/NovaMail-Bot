@@ -1,0 +1,17 @@
+name: 24/7 Cloud Bot Keep-Alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep_alive:
+    name: Ping NovaMail Cloud Server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Health Endpoint
+        run: |
+          echo "Pinging NovaMail Cloud Bot..."
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" https://novamail-bot.onrender.com/health)
+          echo "$RESPONSE"

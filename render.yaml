@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: novamail-cloud-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_cloud.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: 9003932498:AAHWTgOccXRVr6eKeIpPZuNmsJ8VzjbyfgA
+      - key: TELEGRAM_PASSWORD
+        value: MD7-LY7
+      - key: TELEGRAM_AUTH_CHAT
+        value: "8925386980"

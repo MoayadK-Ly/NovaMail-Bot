@@ -163,6 +163,25 @@ PLATFORMS_STANDARD_50 = [
 
 ALL_100_PLATFORMS = PLATFORMS_POPULAR_50 + PLATFORMS_STANDARD_50
 
+
+STATE_FILE = os.path.join(os.path.dirname(__file__), 'cloud_user_state.json')
+
+def load_user_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_user_state(st):
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(st, f, ensure_ascii=False)
+    except Exception:
+        pass
+
 def load_accounts():
     if os.path.exists(DB_FILE):
         try:
@@ -452,7 +471,8 @@ def telegram_worker():
                     else:
                         cmd_clean = text.lower().strip()
 
-                        def provision_account_for(site_name, site_url, account_name=None, username=None):
+                        def provision_account_for(site_name, site_url, target_chat_id=None, account_name=None, username=None):
+                            cid = target_chat_id or chat_id
                             if not username:
                                 username = f"novauser{random.randint(10, 99)}"
                             if not account_name:
@@ -462,7 +482,7 @@ def telegram_worker():
                                 http_session.post(
                                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                                     json={
-                                        'chat_id': chat_id,
+                                        'chat_id': cid,
                                         'text': (
                                             f"🔍 *جاري تجهيز الحساب وتشغيل 50 فحص ومحاكاة الدخول من 50 متصفح بالسحاب لـ ({site_name.upper()})...*\n\n"
                                             "⏳ _يتم الآن فحص 20 متصفح كمبيوتر وجوال، ومطابقة البصمات، والتأكد من سلامة الحساب بالكامل قبل التسليم..._"
@@ -526,7 +546,7 @@ def telegram_worker():
                                 http_session.post(
                                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                                     json={
-                                        'chat_id': chat_id,
+                                        'chat_id': cid,
                                         'text': rep,
                                         'parse_mode': 'Markdown',
                                         'reply_markup': {
@@ -752,7 +772,7 @@ def telegram_worker():
                                 try:
                                     http_session.post(
                                         f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                                        data={'chat_id': chat_id, 'caption': '📊 تفضل، ملف حساباتك السحابية بصيغة CSV المتوافقة مع إكسل!'},
+                                        data={'chat_id': cid, 'caption': '📊 تفضل، ملف حساباتك السحابية بصيغة CSV المتوافقة مع إكسل!'},
                                         files=files,
                                         timeout=12
                                     )
@@ -810,7 +830,7 @@ def telegram_worker():
                                         cap = f"🖼️ *بطاقة اعتماد الحساب السحابية — NovaMail Badge*\n🎯 المنصة: *{target_ba.get('site_name','')}* | معتمد 50/50 🛡️"
                                         http_session.post(
                                             f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                                            data={'chat_id': chat_id, 'caption': cap},
+                                            data={'chat_id': cid, 'caption': cap},
                                             files=files,
                                             timeout=10
                                         )
@@ -889,8 +909,16 @@ def telegram_worker():
                                         lines.append(f"*{idx_m}. {r_m.get('site_name','')}* (@{r_m.get('username','')}):\n📧 `{r_m.get('email','')}`\n🔑 `{r_m.get('password','')}`")
                                     reply = "\n".join(lines)
 
+                        else:
+                            # Auto-provision on fallback words like تخطي or tiktok
+                            if any(w in cmd_clean for w in ['تخطي', 'skip', 'انشاء', 'حساب', 'تيك', 'tiktok']):
+                                reply = provision_account_for('TikTok', 'https://www.tiktok.com/signup', target_chat_id=chat_id)
+                            else:
+                                reply = "⚡ *جاهز لخدمتك!* المس أي زر بالأسفل أو أرسل `/signup` لإنشاء وفحص حسابك فوراً."
+                                reply_markup = main_reply_dock
+
                     if reply:
-                        payload = {'chat_id': chat_id, 'text': reply, 'parse_mode': 'Markdown'}
+                        payload = {'chat_id': cid, 'text': reply, 'parse_mode': 'Markdown'}
                         if reply_markup:
                             payload['reply_markup'] = reply_markup
                         http_session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=6)

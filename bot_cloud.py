@@ -52,6 +52,7 @@ inbox_cache = []
 prewarmed_pool = []
 user_signup_state = {}
 notified_codes_set = set()
+active_cloud_mailboxes = {} # email -> token mapping for live multi-inbox polling
 server_start_time = time.time()
 
 # 100 Platforms Catalog
@@ -267,21 +268,44 @@ def poll_inbox_worker():
     global inbox_cache
     while True:
         try:
-            tok = current_session.get('token')
-            if tok and current_session.get('provider') == 'mailtm':
-                r = http_session.get('https://api.mail.tm/messages', headers={'Authorization': f'Bearer {tok}'}, timeout=6)
-                if r.status_code == 200:
-                    msgs = r.json().get('hydra:member', [])
-                    for m in msgs:
-                        m_id = m.get('id')
-                        subj = m.get('subject', '')
-                        intro = m.get('intro', '')
-                        c = extract_otp(f"{subj} {intro}")
-                        if c:
-                            forward_code_to_tg(c, subj, current_session.get('email', ''))
+            # Poll all active mailboxes
+            targets = []
+            with state_lock:
+                if current_session.get('token'):
+                    targets.append((current_session.get('email'), current_session.get('token')))
+                for em, tk in list(active_cloud_mailboxes.items()):
+                    if (em, tk) not in targets:
+                        targets.append((em, tk))
+            
+            for em_addr, tok_val in targets[-10:]:
+                if not tok_val:
+                    continue
+                try:
+                    r = http_session.get('https://api.mail.tm/messages', headers={'Authorization': f'Bearer {tok_val}'}, timeout=5)
+                    if r.status_code == 200:
+                        msgs = r.json().get('hydra:member', [])
+                        for m in msgs:
+                            subj = m.get('subject', '')
+                            intro = m.get('intro', '')
+                            # Fetch full detail if code not in intro
+                            full_text = f"{subj} {intro}"
+                            c = extract_otp(full_text)
+                            if not c and m.get('id'):
+                                try:
+                                    r_det = http_session.get(f"https://api.mail.tm/messages/{m['id']}", headers={'Authorization': f'Bearer {tok_val}'}, timeout=4)
+                                    if r_det.status_code == 200:
+                                        det = r_det.json()
+                                        full_text += " " + (det.get('text') or '') + " " + (det.get('html') or '')
+                                        c = extract_otp(full_text)
+                                except Exception:
+                                    pass
+                            if c:
+                                forward_code_to_tg(c, subj, em_addr)
+                except Exception:
+                    pass
         except Exception:
             pass
-        time.sleep(4.0)
+        time.sleep(3.0)
 
 def forward_code_to_tg(code, source, email):
     key = f"{email}:{code}"
@@ -508,6 +532,10 @@ def telegram_worker():
                                 sess = create_raw_email(custom_name=username)
                             
                             b_email = sess.get('email', f"{username}@fldubai.com")
+                            with state_lock:
+                                current_session = sess
+                                if sess.get('token'):
+                                    active_cloud_mailboxes[b_email] = sess['token']
 
                             new_entry = {
                                 'id': str(time.time()),
@@ -730,7 +758,43 @@ def telegram_worker():
                             reply_markup = main_reply_dock
 
                         elif cmd_clean == 'cmd_code' or text.startswith('/code'):
-                            reply = f"📭 لا يوجد كود تفعيل جديد حتى الآن للإيميل `{current_session.get('email', '')}`.\n_(يرسل البوت الكود تلقائياً فور وروده في إشعار منبثق)_"
+                            # Live on-demand fetch from mail.tm
+                            found_code = None
+                            found_subj = ''
+                            with state_lock:
+                                check_tok = current_session.get('token')
+                                check_em = current_session.get('email', '')
+                            if check_tok:
+                                try:
+                                    r_c = http_session.get('https://api.mail.tm/messages', headers={'Authorization': f'Bearer {check_tok}'}, timeout=5)
+                                    if r_c.status_code == 200:
+                                        m_list = r_c.json().get('hydra:member', [])
+                                        for m_item in m_list:
+                                            subj_c = m_item.get('subject', '')
+                                            intro_c = m_item.get('intro', '')
+                                            c_c = extract_otp(f"{subj_c} {intro_c}")
+                                            if not c_c and m_item.get('id'):
+                                                r_d = http_session.get(f"https://api.mail.tm/messages/{m_item['id']}", headers={'Authorization': f'Bearer {check_tok}'}, timeout=4)
+                                                if r_d.status_code == 200:
+                                                    c_c = extract_otp(r_d.json().get('text', '') + ' ' + (r_d.json().get('html') or ''))
+                                            if c_c:
+                                                found_code = c_c
+                                                found_subj = subj_c
+                                                break
+                                except Exception:
+                                    pass
+                            if found_code:
+                                reply = (
+                                    "🔑 *تم استخراج كود التفعيل بنجاح!*\n\n"
+                                    f"الكود (اضغط للنسخ 📲):\n`{found_code}`\n\n"
+                                    f"📌 المصدر: {found_subj}\n"
+                                    f"📧 للإيميل: `{check_em}`"
+                                )
+                            else:
+                                reply = (
+                                    f"📭 *جاري انتظار وصول الكود للإيميل:*\n`{check_em}`\n\n"
+                                    "⏳ _تأكد من الضغط على زر 'إرسال الرمز' أو 'Resend Code' في المنصة، وسيصلك الرمز هنا فوراً خلال ثوانٍ!_"
+                                )
                             reply_markup = main_reply_dock
 
                         elif cmd_clean == 'cmd_accounts' or text.startswith('/accounts'):

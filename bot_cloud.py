@@ -32,14 +32,16 @@ DB_FILE = os.path.join(os.path.dirname(__file__), 'cloud_accounts.json')
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'cloud_config.json')
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'cloud_user_state.json')
 TOKENS_FILE = os.path.join(os.path.dirname(__file__), 'cloud_tokens.json')
+USERS_ACCESS_FILE = os.path.join(os.path.dirname(__file__), 'cloud_users_access.json')
 
 state_lock = threading.Lock()
 pool_lock = threading.Lock()
 tokens_lock = threading.Lock()
+access_lock = threading.Lock()
 http_session = requests.Session()
 http_session.headers.update({'User-Agent': 'NovaMail-CloudBot/4.5 (Render 24/7 Engine)'})
 
-# Helper functions for 10-Minute Dynamic Activation Tokens
+# Helper functions for 10-Minute Dynamic Activation Tokens & Tiered Access (Permanent / Timed)
 def load_tokens():
     if os.path.exists(TOKENS_FILE):
         try:
@@ -56,7 +58,47 @@ def save_tokens(tok_list):
     except Exception:
         pass
 
-def generate_new_token(creator_chat_id='8925386980', duration_seconds=600):
+def load_user_access():
+    if os.path.exists(USERS_ACCESS_FILE):
+        try:
+            with open(USERS_ACCESS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_user_access(data):
+    try:
+        with open(USERS_ACCESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def check_user_access(chat_id):
+    cid = str(chat_id).strip()
+    if cid == DEFAULT_CHAT:
+        return True, 'ADMIN', None
+    
+    with access_lock:
+        access_map = load_user_access()
+        if cid in access_map:
+            u_info = access_map[cid]
+            tier = u_info.get('tier', 'PERMANENT')
+            if tier in ['ADMIN', 'PERMANENT']:
+                return True, tier, None
+            elif tier == 'TIMED':
+                exp = u_info.get('expires_at', 0)
+                now = time.time()
+                if now < exp:
+                    rem_sec = int(exp - now)
+                    return True, 'TIMED', rem_sec
+                else:
+                    return False, 'EXPIRED_TIMED', 0
+        if cid in AUTH_CHATS:
+            return True, 'PERMANENT', None
+        return False, 'UNAUTHORIZED', 0
+
+def generate_new_token(creator_chat_id='8925386980', token_type='PERMANENT', access_duration_hours=None, duration_seconds=600):
     with tokens_lock:
         tokens = load_tokens()
         now = time.time()
@@ -64,6 +106,8 @@ def generate_new_token(creator_chat_id='8925386980', duration_seconds=600):
         code = f"NV-{random.randint(1000, 9999)}-{''.join(random.choices(string.ascii_uppercase, k=2))}"
         entry = {
             'token': code,
+            'token_type': token_type, # 'PERMANENT' or 'TIMED'
+            'access_duration_hours': access_duration_hours, # 1, 3, 6, 10, 24
             'created_at': now,
             'expires_at': now + duration_seconds,
             'duration_minutes': int(duration_seconds / 60),
@@ -78,6 +122,7 @@ def generate_new_token(creator_chat_id='8925386980', duration_seconds=600):
 
 def verify_and_consume_token(token_code, user_chat_id):
     clean_code = token_code.strip().upper()
+    cid = str(user_chat_id).strip()
     with tokens_lock:
         tokens = load_tokens()
         now = time.time()
@@ -87,10 +132,36 @@ def verify_and_consume_token(token_code, user_chat_id):
                     return False, 'ALREADY_USED', t
                 if now > t.get('expires_at', 0):
                     return False, 'EXPIRED', t
+                
+                # Mark token consumed
                 t['used'] = True
-                t['used_by'] = str(user_chat_id)
+                t['used_by'] = cid
                 t['used_at'] = now
                 save_tokens(tokens)
+                
+                # Apply access tier
+                with access_lock:
+                    acc_map = load_user_access()
+                    t_type = t.get('token_type', 'PERMANENT')
+                    if t_type == 'PERMANENT':
+                        acc_map[cid] = {
+                            'tier': 'PERMANENT',
+                            'duration_hours': None,
+                            'expires_at': None,
+                            'activated_at': now,
+                            'token_used': t['token']
+                        }
+                    else:
+                        d_hrs = t.get('access_duration_hours', 1)
+                        acc_map[cid] = {
+                            'tier': 'TIMED',
+                            'duration_hours': d_hrs,
+                            'expires_at': now + (d_hrs * 3600),
+                            'activated_at': now,
+                            'token_used': t['token']
+                        }
+                    save_user_access(acc_map)
+                
                 return True, 'VALID', t
         return False, 'NOT_FOUND', None
 
@@ -583,8 +654,10 @@ def telegram_worker():
                     reply_markup = None
                     cid = chat_id
 
-                    # Security Gate (Dynamic 10-Minute Token or Master Password)
-                    if chat_id not in AUTH_CHATS:
+                    # Security Gate (Dynamic 10-Minute Token, Timed Access, or Master Password)
+                    has_access, access_reason, rem_sec = check_user_access(chat_id)
+
+                    if not has_access:
                         token_candidate = None
                         if text.startswith('/start ') and len(text.split()) > 1:
                             cand = text.split()[1].strip().upper()
@@ -596,26 +669,40 @@ def telegram_worker():
                         if token_candidate:
                             ok_tok, reason_tok, tok_obj = verify_and_consume_token(token_candidate, chat_id)
                             if ok_tok:
-                                AUTH_CHATS.append(chat_id)
-                                reply = (
-                                    "🎉 *مبروك! تم تفعيل وتوثيق حسابك بنجاح عبر توكن التفعيل المؤقت!* 🔓🟢\n\n"
-                                    "أهلاً بك في روبوت *NovaMail Cloud 24/7* 👑\n"
-                                    "_(حسابك موثق الآن بشكل دائم وتستطيع استخدامه في أي وقت)_\n\n"
-                                    "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك للبدء فوراً!*"
-                                )
+                                if chat_id not in AUTH_CHATS:
+                                    AUTH_CHATS.append(chat_id)
+                                
+                                t_type = tok_obj.get('token_type', 'PERMANENT')
+                                if t_type == 'PERMANENT':
+                                    reply = (
+                                        "🎉 *مبروك! تم تفعيل وتوثيق حسابك بنجاح بعضوية دائمة (VIP)!* 🔓🟢\n\n"
+                                        "أهلاً بك في روبوت *NovaMail Cloud 24/7* 👑\n"
+                                        "_(حسابك موثق الآن بشكل دائم وتستطيع استخدامه في أي وقت دون انتهاء)_\n\n"
+                                        "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك للبدء فوراً!*"
+                                    )
+                                else:
+                                    d_hrs = tok_obj.get('access_duration_hours', 1)
+                                    reply = (
+                                        f"🎉 *مبروك! تم تفعيل تصريح استخدام مؤقت بنجاح لمدة ({d_hrs} ساعات)!* ⏱️🟢\n\n"
+                                        "أهلاً بك في روبوت *NovaMail Cloud 24/7* 👑\n"
+                                        f"_(يمكنك استخدام كافة ميزات البوت بحرية كاملة خلال الـ {d_hrs} ساعات القادمة)_\n\n"
+                                        "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك للبدء فوراً!*"
+                                    )
                                 reply_markup = main_reply_dock
                                 # Notify admin on Keymaster Bot
                                 try:
+                                    tier_desc = "دائم مدى الحياة 👑" if t_type == 'PERMANENT' else f"مؤقت {tok_obj.get('access_duration_hours')} ساعات ⏱️"
                                     http_session.post(
                                         f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/sendMessage",
                                         json={
                                             'chat_id': DEFAULT_CHAT,
                                             'text': (
-                                                "🔔 *إشعار أمان — مستخدم جديد قام بالتفعيل!*\n\n"
-                                                f"👤 معرف المستخدم الجديد: `{chat_id}`\n"
-                                                f"🎟️ التوكن المستخدم: `{token_candidate}`\n"
+                                                "🔔 *إشعار أمان — مستخدم قام بالتفعيل!*\n\n"
+                                                f"👤 معرف المستخدم: `{chat_id}`\n"
+                                                f"🎟️ التوكن: `{token_candidate}`\n"
+                                                f"🛡️ نوع التصريح: *{tier_desc}*\n"
                                                 f"⏰ وقت التفعيل: {time.strftime('%H:%M:%S')}\n"
-                                                "✅ تم اعتماد وتوثيق حسابه في البوت الرئيسي بنجاح."
+                                                "✅ تم اعتماد حسابه في البوت الرئيسي بنجاح."
                                             ),
                                             'parse_mode': 'Markdown'
                                         },
@@ -626,7 +713,7 @@ def telegram_worker():
                             elif reason_tok == 'EXPIRED':
                                 reply = (
                                     "⏳ *عذراً، هذا التوكن انتهت صلاحيته!*\n\n"
-                                    "_(مدة صلاحية التوكن 10 دقائق فقط وقد انتهت)_\n"
+                                    "_(مهلة استخدام كود التوكن 10 دقائق فقط وقد انتهت)_\n"
                                     "يرجى طلب توكن تفعيل جديد من المسؤول."
                                 )
                             elif reason_tok == 'ALREADY_USED':
@@ -639,16 +726,24 @@ def telegram_worker():
                                 reply = "⚠️ *رمز التوكن غير صحيح.* تأكد من نسخ الرمز بالكامل كما هو."
                         elif text == BOT_PASSWORD:
                             AUTH_CHATS.append(chat_id)
+                            with access_lock:
+                                acc_map = load_user_access()
+                                acc_map[str(chat_id)] = {'tier': 'ADMIN', 'duration_hours': None, 'expires_at': None, 'activated_at': time.time()}
+                                save_user_access(acc_map)
                             reply = (
-                                "🔓 *تم التحقق وتفعيل الوصول السحابي بنجاح!* 🟢\n\n"
-                                "أهلاً بك في بوت *NovaMail Cloud 24/7* 👑\n"
-                                "_(يعمل في السحاب بشكل دائم ومستقل حتى لو الكمبيوتر مغلق)_\n\n"
+                                "🔓 *تم التحقق وتفعيل الوصول السحابي كمسؤول رئيسي!* 🟢\n\n"
+                                "أهلاً بك في بوت *NovaMail Cloud 24/7* 👑\n\n"
                                 "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك!*"
                             )
                             reply_markup = main_reply_dock
+                        elif access_reason == 'EXPIRED_TIMED':
+                            reply = (
+                                "⏳ *عذراً، انتهت فترة تصريحك المؤقتة لاستخدام NovaMail!*\n\n"
+                                "لقد انتهت الساعات المخصصة لتصريح حسابك. للاستمرار في الاستخدام وتوليد الحسابات والأكواد، يرجى إدخال رمز توكن جديد صادر من بوت التفعيل `@MoayadAuth_bot` أو التواصل مع الإدارة."
+                            )
                         else:
                             reply = (
-                                "🔒 *عذراً، هذا البوت خاص ومحمي بنظام التوكنات المؤقتة!*\n\n"
+                                "🔒 *عذراً، هذا البوت خاص ومحمي بنظام التوكنات والتصاريح!*\n\n"
                                 "لتفعيل حسابك، يرجى إرسال **رمز التفعيل المؤقت (Token)** الخاص بك الصادر من بوت التفعيل `@MoayadAuth_bot` أو كلمة المرور السرية:"
                             )
                     else:
@@ -1358,6 +1453,72 @@ def keymaster_bot_worker():
                             except Exception:
                                 pass
                             continue
+                        elif text.startswith('gen_tier_'):
+                            tier_key = text.replace('gen_tier_', '').strip()
+                            t_type = 'PERMANENT'
+                            t_hrs = None
+                            tier_lbl = '👑 تفعيل دائم (مدى الحياة)'
+                            if tier_key == '1h':
+                                t_type = 'TIMED'
+                                t_hrs = 1
+                                tier_lbl = '⏱️ تصريح مؤقت (1 ساعة)'
+                            elif tier_key == '3h':
+                                t_type = 'TIMED'
+                                t_hrs = 3
+                                tier_lbl = '⏱️ تصريح مؤقت (3 ساعات)'
+                            elif tier_key == '6h':
+                                t_type = 'TIMED'
+                                t_hrs = 6
+                                tier_lbl = '⏱️ تصريح مؤقت (6 ساعات)'
+                            elif tier_key == '10h':
+                                t_type = 'TIMED'
+                                t_hrs = 10
+                                tier_lbl = '⏱️ تصريح مؤقت (10 ساعات)'
+                            elif tier_key == '24h':
+                                t_type = 'TIMED'
+                                t_hrs = 24
+                                tier_lbl = '🌙 تصريح مؤقت (24 ساعة)'
+
+                            tok_entry = generate_new_token(creator_chat_id=chat_id, token_type=t_type, access_duration_hours=t_hrs, duration_seconds=600)
+                            code_str = tok_entry['token']
+                            exp_str = time.strftime('%I:%M:%S %p', time.localtime(tok_entry['expires_at']))
+                            deep_link = f"https://t.me/IMoayadNova_bot?start={code_str}"
+
+                            try:
+                                http_session.post(
+                                    f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/answerCallbackQuery",
+                                    json={'callback_query_id': cb_id, 'text': f"✅ تم توليد: {tier_lbl}"},
+                                    timeout=3
+                                )
+                            except Exception:
+                                pass
+
+                            reply = (
+                                "🔑 *تم إصدار توكن تفعيل جديد بنجاح!* ✅\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🎟️ *رمز التوكن (اضغط للنسخ بلمسة واحدة 📲):*\n"
+                                f"`{code_str}`\n\n"
+                                f"⏱️ *صلاحية استخدام الكود:* `10 دقائق فقط` (ينتهي: `{exp_str}`)\n"
+                                f"🛡️ *نوع التصريح للمستخدم:* *{tier_lbl}*\n"
+                                "🔒 *الاستخدام:* لمرة واحدة فقط (Single-Use)\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🚀 *رابط التفعيل السريع بنقرة واحدة (أرسله للمستخدم):*\n"
+                                f"{deep_link}\n\n"
+                                "💡 _(بمجرد أن يضغط المستخدم على الرابط، يفتح له البوت الرئيسي مفعل تلقائياً دون كتابة أي شيء!)_"
+                            )
+                            reply_markup = {
+                                'inline_keyboard': [
+                                    [{'text': f"📋 نسخ كود التوكن: {code_str}", 'callback_data': f"copy_{code_str}"}],
+                                    [{'text': '🚀 تجربة فتح الرابط في البوت الرئيسي', 'url': deep_link}],
+                                    [{'text': '🗑️ حرق وإلغاء هذا التوكن', 'callback_data': f"burn_tok_{code_str}"}]
+                                ]
+                            }
+                            http_session.post(
+                                f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/sendMessage",
+                                json={'chat_id': chat_id, 'text': reply, 'reply_markup': reply_markup, 'parse_mode': 'Markdown'},
+                                timeout=6
+                            )
+                            continue
                         else:
                             try:
                                 http_session.post(f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/answerCallbackQuery", json={'callback_query_id': cb_id}, timeout=3)
@@ -1394,32 +1555,28 @@ def keymaster_bot_worker():
                             )
                             reply_markup = keymaster_dock
 
-                        elif cmd_clean in ['🎟️ توليد توكن تفعيل جديد (10 دقائق)', '/new', '/gen', '/token', 'توليد', 'توكن']:
-                            tok_entry = generate_new_token(creator_chat_id=chat_id, duration_seconds=600)
-                            code_str = tok_entry['token']
-                            exp_str = time.strftime('%I:%M:%S %p', time.localtime(tok_entry['expires_at']))
-                            deep_link = f"https://t.me/IMoayadNova_bot?start={code_str}"
-                            
+                        elif cmd_clean in ['🎟️ توليد توكن تفعيل جديد (10 دقائق)', '🎟️ توليد توكن تفعيل جديد', '/new', '/gen', '/token', 'توليد', 'توكن']:
                             reply = (
-                                "🔑 *تم إصدار توكن تفعيل مؤقت جديد بنجاح!* ✅\n"
+                                "🎟️ *توليد توكن تفعيل جديد (صلاحية الكود: 10 دقائق)*\n"
                                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                                "🎟️ *رمز التوكن (اضغط للنسخ بلمسة واحدة 📲):*\n"
-                                f"`{code_str}`\n\n"
-                                f"⏱️ *مدة الصلاحية:* `10 دقائق فقط` (ينتهي: `{exp_str}`)\n"
-                                "🔒 *نوع التصريح:* تفعيل دائم لحساب مستخدم جديد (Single-Use)\n"
-                                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                                "🚀 *رابط التفعيل السريع بنقرة واحدة (أرسله للمستخدم):*\n"
-                                f"{deep_link}\n\n"
-                                "💡 _(بمجرد أن يضغط المستخدم على الرابط، يفتح له البوت الرئيسي مفعل تلقائياً دون كتابة أي شيء!)_"
+                                "👇 *حدد نوع تصريح الاستخدام الذي ترغب بمنحه للمستخدم:*\n\n"
+                                "👑 *تفعيل دائم (VIP):* يبقى حسابه مفعلاً للأبد دون انتهاء.\n"
+                                "⏱️ *تصريح مؤقت (1 - 24 ساعة):* تنتهي صلاحية وصوله بعد انقضاء الساعات المحددة، ويُطلب منه توكن جديد."
                             )
                             reply_markup = {
                                 'inline_keyboard': [
-                                    [{'text': f"📋 نسخ كود التوكن: {code_str}", 'callback_data': f"copy_{code_str}"}],
-                                    [{'text': '🚀 تجربة فتح الرابط في البوت الرئيسي', 'url': deep_link}],
-                                    [{'text': '🗑️ حرق وإلغاء هذا التوكن', 'callback_data': f"burn_tok_{code_str}"}]
+                                    [{'text': '👑 1. تفعيل دائم مدى الحياة', 'callback_data': 'gen_tier_perm'}],
+                                    [
+                                        {'text': '⏱️ 2. تصريح 1 ساعة', 'callback_data': 'gen_tier_1h'},
+                                        {'text': '⏱️ 3. تصريح 3 ساعات', 'callback_data': 'gen_tier_3h'}
+                                    ],
+                                    [
+                                        {'text': '⏱️ 4. تصريح 6 ساعات', 'callback_data': 'gen_tier_6h'},
+                                        {'text': '⏱️ 5. تصريح 10 ساعات', 'callback_data': 'gen_tier_10h'}
+                                    ],
+                                    [{'text': '🌙 6. تصريح 24 ساعة (يوم كامل)', 'callback_data': 'gen_tier_24h'}]
                                 ]
                             }
-
                         elif cmd_clean in ['⏳ التوكنات النشطة المتبقية', '/active', 'نشط', 'النشطة']:
                             all_toks = load_tokens()
                             now = time.time()
@@ -1431,42 +1588,57 @@ def keymaster_bot_worker():
                                 )
                                 reply_markup = keymaster_dock
                             else:
-                                lines = [f"⏳ *قائمة التوكنات النشطة السارية حالياً ({len(active_list)} توكن):*\n"]
+                                lines_out = [f"⏳ *قائمة التوكنات النشطة السارية حالياً ({len(active_list)} توكن):*\n"]
                                 for idx_t, at in enumerate(active_list, 1):
                                     rem_sec = int(at['expires_at'] - now)
                                     rem_min = rem_sec // 60
                                     rem_s = rem_sec % 60
                                     c_t = at['token']
-                                    lines.append(
-                                        f"*{idx_t}.* `{c_t}`\n"
-                                        f"⏱️ متبقي: *{rem_min} دقيقة و {rem_s} ثانية*\n"
+                                    t_mode = "👑 دائم" if at.get('token_type') == 'PERMANENT' else f"⏱️ مؤقت {at.get('access_duration_hours', 1)}h"
+                                    lines_out.append(
+                                        f"*{idx_t}.* `{c_t}` ({t_mode})\n"
+                                        f"⏱️ ينتهي الكود خلال: *{rem_min} دقيقة و {rem_s} ثانية*\n"
                                         f"🔗 `https://t.me/IMoayadNova_bot?start={c_t}`\n"
                                     )
-                                lines.append("💡 _المس كود التوكن لنسخه فوراً 📲_")
-                                reply = "\n".join(lines)
+                                lines_out.append("💡 _المس كود التوكن لنسخه فوراً 📲_")
+                                reply = "\n".join(lines_out)
                                 reply_markup = keymaster_dock
-
                         elif cmd_clean in ['👥 المستخدمين الموثقين', '/users', 'مستخدمين', 'المستخدمين']:
-                            all_toks = load_tokens()
-                            used_list = [t for t in all_toks if t.get('used')]
-                            if not used_list:
+                            with access_lock:
+                                acc_map = load_user_access()
+                            now = time.time()
+                            if not acc_map:
                                 reply = (
                                     "📭 *لم يقم أي مستخدم جديد بالتفعيل عبر التوكنات حتى الآن.*\n"
-                                    "عند تفعيل أي مستخدم ستظهر بياناته هنا فوراً."
+                                    "عند تفعيل أي مستخدم ستظهر بياناته هنا فوراً مع تفاصيل تصريحه."
                                 )
                                 reply_markup = keymaster_dock
                             else:
-                                lines = [f"👥 *سجل المستخدمين الذين تم تفعيلهم ({len(used_list)} مستخدم):*\n"]
-                                for idx_u, ut in enumerate(used_list[:15], 1):
-                                    u_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ut.get('used_at') or ut.get('created_at')))
-                                    lines.append(
-                                        f"*{idx_u}.* معرف: `{ut.get('used_by','مجهول')}`\n"
-                                        f"🎟️ التوكن: `{ut.get('token','')}`\n"
-                                        f"⏰ التوقيت: `{u_time}`\n"
+                                lines_out = [f"👥 *سجل المستخدمين الموثقين ({len(acc_map)} مستخدم):*\n"]
+                                for idx_u, (u_id, u_info) in enumerate(list(acc_map.items())[:20], 1):
+                                    tier_val = u_info.get('tier', 'PERMANENT')
+                                    u_tok = u_info.get('token_used', '—')
+                                    act_t = time.strftime('%m-%d %I:%M %p', time.localtime(u_info.get('activated_at', now)))
+                                    if tier_val == 'PERMANENT':
+                                        status_str = "👑 دائم مدى الحياة"
+                                    elif tier_val == 'TIMED':
+                                        exp_v = u_info.get('expires_at', 0)
+                                        if exp_v > now:
+                                            rem_s = int(exp_v - now)
+                                            rem_h = rem_s // 3600
+                                            rem_m = (rem_s % 3600) // 60
+                                            status_str = f"⏱️ متبقي {rem_h}h {rem_m}m"
+                                        else:
+                                            status_str = "❌ انتهت الصلاحية"
+                                    else:
+                                        status_str = str(tier_val)
+                                    lines_out.append(
+                                        f"*{idx_u}.* معرف: `{u_id}`\n"
+                                        f"🛡️ التصريح: *{status_str}*\n"
+                                        f"🎟️ التوكن: `{u_tok}` | ⏰ `{act_t}`\n"
                                     )
-                                reply = "\n".join(lines)
+                                reply = "\n".join(lines_out)
                                 reply_markup = keymaster_dock
-
                         elif cmd_clean in ['📊 إحصائيات النظام', '/stats', 'احصائيات']:
                             all_toks = load_tokens()
                             now = time.time()

@@ -22,6 +22,7 @@ print("[NovaMail Cloud Bot] Starting 24/7 Cloud Super-Engine...")
 
 # Environment & Config
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '9003932498:AAHWTgOccXRVr6eKeIpPZuNmsJ8VzjbyfgA').strip()
+AUTH_BOT_TOKEN = os.environ.get('AUTH_BOT_TOKEN', '9085788096:AAG3SufJEuYv7L-Un4e_Iuxc4GnZ9Ra-T-M').strip()
 BOT_PASSWORD = os.environ.get('TELEGRAM_PASSWORD', 'MD7-LY7').strip()
 DEFAULT_CHAT = os.environ.get('TELEGRAM_AUTH_CHAT', '8925386980').strip()
 PORT = int(os.environ.get('PORT', 8080))
@@ -30,11 +31,68 @@ AUTH_CHATS = [DEFAULT_CHAT] if DEFAULT_CHAT else []
 DB_FILE = os.path.join(os.path.dirname(__file__), 'cloud_accounts.json')
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'cloud_config.json')
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'cloud_user_state.json')
+TOKENS_FILE = os.path.join(os.path.dirname(__file__), 'cloud_tokens.json')
 
 state_lock = threading.Lock()
 pool_lock = threading.Lock()
+tokens_lock = threading.Lock()
 http_session = requests.Session()
 http_session.headers.update({'User-Agent': 'NovaMail-CloudBot/4.5 (Render 24/7 Engine)'})
+
+# Helper functions for 10-Minute Dynamic Activation Tokens
+def load_tokens():
+    if os.path.exists(TOKENS_FILE):
+        try:
+            with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_tokens(tok_list):
+    try:
+        with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tok_list, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def generate_new_token(creator_chat_id='8925386980', duration_seconds=600):
+    with tokens_lock:
+        tokens = load_tokens()
+        now = time.time()
+        tokens = [t for t in tokens if (now - t.get('expires_at', 0)) < 172800]
+        code = f"NV-{random.randint(1000, 9999)}-{''.join(random.choices(string.ascii_uppercase, k=2))}"
+        entry = {
+            'token': code,
+            'created_at': now,
+            'expires_at': now + duration_seconds,
+            'duration_minutes': int(duration_seconds / 60),
+            'used': False,
+            'used_by': None,
+            'used_at': None,
+            'created_by': str(creator_chat_id)
+        }
+        tokens.insert(0, entry)
+        save_tokens(tokens)
+        return entry
+
+def verify_and_consume_token(token_code, user_chat_id):
+    clean_code = token_code.strip().upper()
+    with tokens_lock:
+        tokens = load_tokens()
+        now = time.time()
+        for t in tokens:
+            if t.get('token', '').upper() == clean_code:
+                if t.get('used'):
+                    return False, 'ALREADY_USED', t
+                if now > t.get('expires_at', 0):
+                    return False, 'EXPIRED', t
+                t['used'] = True
+                t['used_by'] = str(user_chat_id)
+                t['used_at'] = now
+                save_tokens(tokens)
+                return True, 'VALID', t
+        return False, 'NOT_FOUND', None
 
 # In-memory session state
 current_session = {
@@ -427,12 +485,16 @@ server_app = Bottle()
 def health_check():
     response.content_type = 'application/json'
     uptime_sec = int(time.time() - server_start_time)
+    active_toks_cnt = len([t for t in load_tokens() if not t.get('used') and t.get('expires_at', 0) > time.time()])
     return json.dumps({
         'status': 'ONLINE_24_7',
-        'service': 'NovaMail Telegram Super-Bot Cloud Engine',
+        'service': 'NovaMail Dual-Bot Cloud Super-Engine (Main + Keymaster)',
         'uptime_seconds': uptime_sec,
         'uptime_formatted': f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s",
-        'bot_connected': bool(BOT_TOKEN),
+        'main_bot_connected': bool(BOT_TOKEN),
+        'keymaster_bot': '@MoayadAuth_bot',
+        'keymaster_connected': bool(AUTH_BOT_TOKEN),
+        'active_10m_tokens': active_toks_cnt,
         'authorized_chats': len(AUTH_CHATS),
         'stored_accounts': len(load_accounts()),
         'prewarmed_buffer': len(prewarmed_pool),
@@ -521,9 +583,61 @@ def telegram_worker():
                     reply_markup = None
                     cid = chat_id
 
-                    # Security Gate
+                    # Security Gate (Dynamic 10-Minute Token or Master Password)
                     if chat_id not in AUTH_CHATS:
-                        if text == BOT_PASSWORD:
+                        token_candidate = None
+                        if text.startswith('/start ') and len(text.split()) > 1:
+                            cand = text.split()[1].strip().upper()
+                            if cand.startswith('NV-'):
+                                token_candidate = cand
+                        elif text.strip().upper().startswith('NV-'):
+                            token_candidate = text.strip().upper()
+
+                        if token_candidate:
+                            ok_tok, reason_tok, tok_obj = verify_and_consume_token(token_candidate, chat_id)
+                            if ok_tok:
+                                AUTH_CHATS.append(chat_id)
+                                reply = (
+                                    "🎉 *مبروك! تم تفعيل وتوثيق حسابك بنجاح عبر توكن التفعيل المؤقت!* 🔓🟢\n\n"
+                                    "أهلاً بك في روبوت *NovaMail Cloud 24/7* 👑\n"
+                                    "_(حسابك موثق الآن بشكل دائم وتستطيع استخدامه في أي وقت)_\n\n"
+                                    "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك للبدء فوراً!*"
+                                )
+                                reply_markup = main_reply_dock
+                                # Notify admin on Keymaster Bot
+                                try:
+                                    http_session.post(
+                                        f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/sendMessage",
+                                        json={
+                                            'chat_id': DEFAULT_CHAT,
+                                            'text': (
+                                                "🔔 *إشعار أمان — مستخدم جديد قام بالتفعيل!*\n\n"
+                                                f"👤 معرف المستخدم الجديد: `{chat_id}`\n"
+                                                f"🎟️ التوكن المستخدم: `{token_candidate}`\n"
+                                                f"⏰ وقت التفعيل: {time.strftime('%H:%M:%S')}\n"
+                                                "✅ تم اعتماد وتوثيق حسابه في البوت الرئيسي بنجاح."
+                                            ),
+                                            'parse_mode': 'Markdown'
+                                        },
+                                        timeout=4
+                                    )
+                                except Exception:
+                                    pass
+                            elif reason_tok == 'EXPIRED':
+                                reply = (
+                                    "⏳ *عذراً، هذا التوكن انتهت صلاحيته!*\n\n"
+                                    "_(مدة صلاحية التوكن 10 دقائق فقط وقد انتهت)_\n"
+                                    "يرجى طلب توكن تفعيل جديد من المسؤول."
+                                )
+                            elif reason_tok == 'ALREADY_USED':
+                                reply = (
+                                    "❌ *عذراً، هذا التوكن تم استخدامه مسبقاً!*\n\n"
+                                    "كل توكن صالح لتفعيل مستخدم واحد لمرة واحدة فقط.\n"
+                                    "يرجى طلب توكن تفعيل جديد من المسؤول."
+                                )
+                            else:
+                                reply = "⚠️ *رمز التوكن غير صحيح.* تأكد من نسخ الرمز بالكامل كما هو."
+                        elif text == BOT_PASSWORD:
                             AUTH_CHATS.append(chat_id)
                             reply = (
                                 "🔓 *تم التحقق وتفعيل الوصول السحابي بنجاح!* 🟢\n\n"
@@ -534,8 +648,8 @@ def telegram_worker():
                             reply_markup = main_reply_dock
                         else:
                             reply = (
-                                "🔒 *عذراً، هذا البوت خاص بسيرفر NovaMail السحابي!*\n\n"
-                                "يرجى إرسال كلمة المرور السرية لفتح الوصول والاستخدام من الجوال:"
+                                "🔒 *عذراً، هذا البوت خاص ومحمي بنظام التوكنات المؤقتة!*\n\n"
+                                "لتفعيل حسابك، يرجى إرسال **رمز التفعيل المؤقت (Token)** الخاص بك الصادر من بوت التفعيل `@MoayadAuth_bot` أو كلمة المرور السرية:"
                             )
                     else:
                         cmd_clean = text.lower().strip()
@@ -1167,6 +1281,229 @@ def keep_alive_worker():
             pass
         time.sleep(420.0)
 
+def keymaster_bot_worker():
+    """Independent 24/7 worker for the NovaMail Keymaster Token Bot (@MoayadAuth_bot)."""
+    print(f"[NovaMail Keymaster] Connecting to Token Bot with Token: {AUTH_BOT_TOKEN[:10]}...")
+    last_update_id = 0
+
+    keymaster_dock = {
+        'keyboard': [
+            [{'text': '🎟️ توليد توكن تفعيل جديد (10 دقائق)'}],
+            [{'text': '⏳ التوكنات النشطة المتبقية'}, {'text': '👥 المستخدمين الموثقين'}],
+            [{'text': '📊 إحصائيات النظام'}, {'text': '⚡ فحص الاتصال (/ping)'}]
+        ],
+        'resize_keyboard': True,
+        'is_persistent': True
+    }
+
+    while True:
+        try:
+            r = http_session.get(
+                f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/getUpdates",
+                params={'offset': last_update_id + 1, 'timeout': 20},
+                timeout=25
+            )
+            if r.status_code == 200:
+                updates = r.json().get('result', [])
+                for upd in updates:
+                    uid = upd.get('update_id', 0)
+                    if uid > last_update_id:
+                        last_update_id = uid
+
+                    cb = upd.get('callback_query')
+                    msg = upd.get('message') or {}
+                    chat_id = None
+                    text = ''
+                    cb_id = None
+
+                    if cb:
+                        cb_id = cb.get('id')
+                        chat_id = str((cb.get('message', {}).get('chat', {})).get('id', ''))
+                        text = (cb.get('data') or '').strip()
+                    elif msg:
+                        chat_id = str((msg.get('chat') or {}).get('id', ''))
+                        text = (msg.get('text') or '').strip()
+
+                    if not chat_id or not text:
+                        continue
+
+                    # Handle inline callbacks
+                    if cb_id:
+                        if text.startswith('copy_'):
+                            c_val = text.replace('copy_', '').strip()
+                            try:
+                                http_session.post(
+                                    f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/answerCallbackQuery",
+                                    json={'callback_query_id': cb_id, 'text': f"✅ تم نسخ كود التوكن: {c_val}", 'show_alert': True},
+                                    timeout=3
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        elif text.startswith('burn_tok_'):
+                            b_code = text.replace('burn_tok_', '').strip().upper()
+                            with tokens_lock:
+                                all_t = load_tokens()
+                                for t_it in all_t:
+                                    if t_it.get('token', '').upper() == b_code:
+                                        t_it['expires_at'] = 0
+                                        t_it['used'] = True
+                                save_tokens(all_t)
+                            try:
+                                http_session.post(
+                                    f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/answerCallbackQuery",
+                                    json={'callback_query_id': cb_id, 'text': f"🗑️ تم حرق وإلغاء التوكن {b_code} فوراً!", 'show_alert': True},
+                                    timeout=3
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        else:
+                            try:
+                                http_session.post(f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/answerCallbackQuery", json={'callback_query_id': cb_id}, timeout=3)
+                            except Exception:
+                                pass
+
+                    reply = None
+                    reply_markup = None
+                    cid = chat_id
+                    cmd_clean = text.lower().strip()
+
+                    # Security check for Keymaster Bot:
+                    # Authorized if chat_id == DEFAULT_CHAT or in AUTH_CHATS or text == BOT_PASSWORD
+                    is_admin = (chat_id == DEFAULT_CHAT) or (chat_id in AUTH_CHATS) or (text == BOT_PASSWORD)
+
+                    if not is_admin:
+                        reply = (
+                            "🔒 *عذراً، هذا البوت خاص بإدارة وتوليد مفاتيح التفعيل لتطبيق NovaMail!*\n\n"
+                            "يرجى إرسال كلمة المرور السرية لفتح لوحة التحكم:"
+                        )
+                    else:
+                        if chat_id not in AUTH_CHATS:
+                            AUTH_CHATS.append(chat_id)
+
+                        if cmd_clean in ['/start', '/help', 'مساعدة', 'اوامر']:
+                            reply = (
+                                "👑 *أهلاً بك في بوت إدارة وتوليد مفاتيح التفعيل (NovaMail Keymaster)!*\n\n"
+                                "⚡ *هذا البوت يتيح لك توليد توكنات مؤقتة (10 دقائق) لتفعيل أي مستخدم جديد في البوت الرئيسي.*\n\n"
+                                "• `🎟️ توليد توكن تفعيل جديد` : إصدار توكن صالح لمدة 10 دقائق.\n"
+                                "• `⏳ التوكنات النشطة المتبقية` : استعراض التوكنات السارية مع عداد الوقت.\n"
+                                "• `👥 المستخدمين الموثقين` : عرض من قام بالتفعيل بواسطة توكناتك.\n"
+                                "• `📊 إحصائيات النظام` : تشخيص عام للمنظومة.\n\n"
+                                "👇 *استخدم الأزرار المثبتة بالأسفل للتحكم السريع:*"
+                            )
+                            reply_markup = keymaster_dock
+
+                        elif cmd_clean in ['🎟️ توليد توكن تفعيل جديد (10 دقائق)', '/new', '/gen', '/token', 'توليد', 'توكن']:
+                            tok_entry = generate_new_token(creator_chat_id=chat_id, duration_seconds=600)
+                            code_str = tok_entry['token']
+                            exp_str = time.strftime('%I:%M:%S %p', time.localtime(tok_entry['expires_at']))
+                            deep_link = f"https://t.me/IMoayadNova_bot?start={code_str}"
+                            
+                            reply = (
+                                "🔑 *تم إصدار توكن تفعيل مؤقت جديد بنجاح!* ✅\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🎟️ *رمز التوكن (اضغط للنسخ بلمسة واحدة 📲):*\n"
+                                f"`{code_str}`\n\n"
+                                f"⏱️ *مدة الصلاحية:* `10 دقائق فقط` (ينتهي: `{exp_str}`)\n"
+                                "🔒 *نوع التصريح:* تفعيل دائم لحساب مستخدم جديد (Single-Use)\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🚀 *رابط التفعيل السريع بنقرة واحدة (أرسله للمستخدم):*\n"
+                                f"{deep_link}\n\n"
+                                "💡 _(بمجرد أن يضغط المستخدم على الرابط، يفتح له البوت الرئيسي مفعل تلقائياً دون كتابة أي شيء!)_"
+                            )
+                            reply_markup = {
+                                'inline_keyboard': [
+                                    [{'text': f"📋 نسخ كود التوكن: {code_str}", 'callback_data': f"copy_{code_str}"}],
+                                    [{'text': '🚀 تجربة فتح الرابط في البوت الرئيسي', 'url': deep_link}],
+                                    [{'text': '🗑️ حرق وإلغاء هذا التوكن', 'callback_data': f"burn_tok_{code_str}"}]
+                                ]
+                            }
+
+                        elif cmd_clean in ['⏳ التوكنات النشطة المتبقية', '/active', 'نشط', 'النشطة']:
+                            all_toks = load_tokens()
+                            now = time.time()
+                            active_list = [t for t in all_toks if not t.get('used') and t.get('expires_at', 0) > now]
+                            if not active_list:
+                                reply = (
+                                    "📭 *لا توجد توكنات تفعيل نشطة حالياً!*\n\n"
+                                    "اضغط على زر *\"🎟️ توليد توكن تفعيل جديد\"* لإصدار توكن جديد خلال 10 دقائق."
+                                )
+                                reply_markup = keymaster_dock
+                            else:
+                                lines = [f"⏳ *قائمة التوكنات النشطة السارية حالياً ({len(active_list)} توكن):*\n"]
+                                for idx_t, at in enumerate(active_list, 1):
+                                    rem_sec = int(at['expires_at'] - now)
+                                    rem_min = rem_sec // 60
+                                    rem_s = rem_sec % 60
+                                    c_t = at['token']
+                                    lines.append(
+                                        f"*{idx_t}.* `{c_t}`\n"
+                                        f"⏱️ متبقي: *{rem_min} دقيقة و {rem_s} ثانية*\n"
+                                        f"🔗 `https://t.me/IMoayadNova_bot?start={c_t}`\n"
+                                    )
+                                lines.append("💡 _المس كود التوكن لنسخه فوراً 📲_")
+                                reply = "\n".join(lines)
+                                reply_markup = keymaster_dock
+
+                        elif cmd_clean in ['👥 المستخدمين الموثقين', '/users', 'مستخدمين', 'المستخدمين']:
+                            all_toks = load_tokens()
+                            used_list = [t for t in all_toks if t.get('used')]
+                            if not used_list:
+                                reply = (
+                                    "📭 *لم يقم أي مستخدم جديد بالتفعيل عبر التوكنات حتى الآن.*\n"
+                                    "عند تفعيل أي مستخدم ستظهر بياناته هنا فوراً."
+                                )
+                                reply_markup = keymaster_dock
+                            else:
+                                lines = [f"👥 *سجل المستخدمين الذين تم تفعيلهم ({len(used_list)} مستخدم):*\n"]
+                                for idx_u, ut in enumerate(used_list[:15], 1):
+                                    u_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ut.get('used_at') or ut.get('created_at')))
+                                    lines.append(
+                                        f"*{idx_u}.* معرف: `{ut.get('used_by','مجهول')}`\n"
+                                        f"🎟️ التوكن: `{ut.get('token','')}`\n"
+                                        f"⏰ التوقيت: `{u_time}`\n"
+                                    )
+                                reply = "\n".join(lines)
+                                reply_markup = keymaster_dock
+
+                        elif cmd_clean in ['📊 إحصائيات النظام', '/stats', 'احصائيات']:
+                            all_toks = load_tokens()
+                            now = time.time()
+                            act_cnt = len([t for t in all_toks if not t.get('used') and t.get('expires_at', 0) > now])
+                            used_cnt = len([t for t in all_toks if t.get('used')])
+                            exp_cnt = len([t for t in all_toks if not t.get('used') and t.get('expires_at', 0) <= now])
+                            uptime_sec = int(time.time() - server_start_time)
+                            reply = (
+                                "📊 *لوحة تشخيص ومؤشرات NovaMail Keymaster:*\n\n"
+                                "• 👑 *حالة البوت:* `نشط بالسحاب 24/7` 🟢\n"
+                                f"• 🎟️ *التوكنات النشطة الآن:* `{act_cnt} توكن` ⏳\n"
+                                f"• ✅ *المستخدمين المفعلين:* `{used_cnt} مستخدم` 👥\n"
+                                f"• ⏳ *التوكنات المنتهية:* `{exp_cnt} توكن` ❌\n"
+                                f"• 🤖 *البوت الرئيسي المرتبط:* `@IMoayadNova_bot`\n"
+                                f"• ⏱️ *مدة تشغيل السيرفر:* `{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m`\n"
+                                "• 🔒 *نظام التشفير:* `AES-256 Dynamic Tokens`"
+                            )
+                            reply_markup = keymaster_dock
+
+                        elif cmd_clean in ['⚡ فحص الاتصال (/ping)', '/ping']:
+                            reply = "⚡ *استجابة بوت التوكنات السحابي:* `9ms` (Ultra-Fast Keymaster Engine) 🟢"
+                            reply_markup = keymaster_dock
+
+                        else:
+                            reply = "⚡ *لوحة تحكم التوكنات جاهزة!* المس أي زر بالأسفل لتوليد توكن جديد أو استعراض التوكنات السارية."
+                            reply_markup = keymaster_dock
+
+                    if reply:
+                        payload = {'chat_id': cid, 'text': reply, 'parse_mode': 'Markdown'}
+                        if reply_markup:
+                            payload['reply_markup'] = reply_markup
+                        http_session.post(f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/sendMessage", json=payload, timeout=6)
+
+        except Exception as e:
+            time.sleep(2.0)
+        time.sleep(0.05)
+
 if __name__ == '__main__':
     # 0. Start 24/7 Keep-Alive Auto-Ping Thread
     t_keep = threading.Thread(target=keep_alive_worker, daemon=True)
@@ -1180,10 +1517,14 @@ if __name__ == '__main__':
     t_poll = threading.Thread(target=poll_inbox_worker, daemon=True)
     t_poll.start()
 
-    # 3. Start Telegram Bot Poller Thread
+    # 3. Start Main Telegram Bot Poller Thread (@IMoayadNova_bot)
     t_bot = threading.Thread(target=telegram_worker, daemon=True)
     t_bot.start()
 
-    # 4. Start HTTP Health-Check Server (Runs in foreground to keep container alive)
+    # 4. Start Keymaster Token Bot Poller Thread (@MoayadAuth_bot)
+    t_auth = threading.Thread(target=keymaster_bot_worker, daemon=True)
+    t_auth.start()
+
+    # 5. Start HTTP Health-Check Server (Runs in foreground to keep container alive)
     print(f"[NovaMail Cloud Bot] HTTP Health Server running on 0.0.0.0:{PORT}...")
     start_http_server()

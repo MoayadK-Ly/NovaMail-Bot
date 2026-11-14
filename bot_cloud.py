@@ -98,16 +98,29 @@ def check_user_access(chat_id):
             return True, 'PERMANENT', None
         return False, 'UNAUTHORIZED', 0
 
-def generate_new_token(creator_chat_id='8925386980', token_type='PERMANENT', access_duration_hours=None, duration_seconds=600):
+def generate_new_token(creator_chat_id='8925386980', token_type='PERMANENT', access_duration_seconds=None, access_duration_hours=None, duration_label=None, duration_seconds=600):
     with tokens_lock:
         tokens = load_tokens()
         now = time.time()
         tokens = [t for t in tokens if (now - t.get('expires_at', 0)) < 172800]
         code = f"NV-{random.randint(1000, 9999)}-{''.join(random.choices(string.ascii_uppercase, k=2))}"
+        
+        final_sec = access_duration_seconds
+        if final_sec is None and access_duration_hours is not None:
+            final_sec = int(access_duration_hours * 3600)
+            
+        if final_sec and not duration_label:
+            if final_sec < 3600:
+                duration_label = f"⚡ {int(final_sec // 60)} دقيقة"
+            else:
+                duration_label = f"⏱️ {int(final_sec // 3600)} ساعة"
+
         entry = {
             'token': code,
             'token_type': token_type, # 'PERMANENT' or 'TIMED'
-            'access_duration_hours': access_duration_hours, # 1, 3, 6, 10, 24
+            'access_duration_seconds': final_sec,
+            'access_duration_hours': access_duration_hours,
+            'duration_label': duration_label,
             'created_at': now,
             'expires_at': now + duration_seconds,
             'duration_minutes': int(duration_seconds / 60),
@@ -152,11 +165,16 @@ def verify_and_consume_token(token_code, user_chat_id):
                             'token_used': t['token']
                         }
                     else:
-                        d_hrs = t.get('access_duration_hours', 1)
+                        d_sec = t.get('access_duration_seconds')
+                        if not d_sec:
+                            d_hrs = t.get('access_duration_hours', 1)
+                            d_sec = int(d_hrs * 3600)
+                        d_lbl = t.get('duration_label') or (f"{int(d_sec // 60)} دقيقة" if d_sec < 3600 else f"{int(d_sec // 3600)} ساعة")
                         acc_map[cid] = {
                             'tier': 'TIMED',
-                            'duration_hours': d_hrs,
-                            'expires_at': now + (d_hrs * 3600),
+                            'duration_seconds': d_sec,
+                            'duration_label': d_lbl,
+                            'expires_at': now + d_sec,
                             'activated_at': now,
                             'token_used': t['token']
                         }
@@ -692,17 +710,17 @@ def telegram_worker():
                                         "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك للبدء فوراً!*"
                                     )
                                 else:
-                                    d_hrs = tok_obj.get('access_duration_hours', 1)
+                                    lbl_dur = tok_obj.get('duration_label') or (f"{tok_obj.get('access_duration_hours', 1)} ساعات" if tok_obj.get('access_duration_hours') else f"{int(tok_obj.get('access_duration_seconds', 3600) // 60)} دقيقة")
                                     reply = (
-                                        f"🎉 *مبروك! تم تفعيل تصريح استخدام مؤقت بنجاح لمدة ({d_hrs} ساعات)!* ⏱️🟢\n\n"
+                                        f"🎉 *مبروك! تم تفعيل تصريح استخدام مؤقت بنجاح ({lbl_dur})!* ⏱️🟢\n\n"
                                         "أهلاً بك في روبوت *NovaMail Cloud 24/7* 👑\n"
-                                        f"_(يمكنك استخدام كافة ميزات البوت بحرية كاملة خلال الـ {d_hrs} ساعات القادمة)_\n\n"
+                                        f"_(يمكنك استخدام كافة ميزات البوت بحرية كاملة خلال: {lbl_dur})_\n\n"
                                         "⚡ *الأزرار السريعة مثبتة الآن أسفل شاشتك للبدء فوراً!*"
                                     )
                                 reply_markup = main_reply_dock
                                 # Notify admin on Keymaster Bot
                                 try:
-                                    tier_desc = "دائم مدى الحياة 👑" if t_type == 'PERMANENT' else f"مؤقت {tok_obj.get('access_duration_hours')} ساعات ⏱️"
+                                    tier_desc = "دائم مدى الحياة 👑" if t_type == 'PERMANENT' else (tok_obj.get('duration_label') or f"مؤقت {tok_obj.get('access_duration_hours', 1)} ساعات ⏱️")
                                     http_session.post(
                                         f"https://api.telegram.org/bot{AUTH_BOT_TOKEN}/sendMessage",
                                         json={
@@ -1492,30 +1510,29 @@ def keymaster_bot_worker():
                         elif text.startswith('gen_tier_'):
                             tier_key = text.replace('gen_tier_', '').strip()
                             t_type = 'PERMANENT'
+                            t_sec = None
                             t_hrs = None
                             tier_lbl = '👑 تفعيل دائم (مدى الحياة)'
-                            if tier_key == '1h':
-                                t_type = 'TIMED'
-                                t_hrs = 1
-                                tier_lbl = '⏱️ تصريح مؤقت (1 ساعة)'
+                            if tier_key == '15m':
+                                t_type = 'TIMED'; t_sec = 15 * 60; tier_lbl = '⚡ تصريح مؤقت (15 دقيقة)'
+                            elif tier_key == '30m':
+                                t_type = 'TIMED'; t_sec = 30 * 60; tier_lbl = '⚡ تصريح مؤقت (30 دقيقة)'
+                            elif tier_key == '45m':
+                                t_type = 'TIMED'; t_sec = 45 * 60; tier_lbl = '⚡ تصريح مؤقت (45 دقيقة)'
+                            elif tier_key == '1h':
+                                t_type = 'TIMED'; t_sec = 3600; t_hrs = 1; tier_lbl = '⏱️ تصريح مؤقت (1 ساعة)'
                             elif tier_key == '3h':
-                                t_type = 'TIMED'
-                                t_hrs = 3
-                                tier_lbl = '⏱️ تصريح مؤقت (3 ساعات)'
+                                t_type = 'TIMED'; t_sec = 3 * 3600; t_hrs = 3; tier_lbl = '⏱️ تصريح مؤقت (3 ساعات)'
                             elif tier_key == '6h':
-                                t_type = 'TIMED'
-                                t_hrs = 6
-                                tier_lbl = '⏱️ تصريح مؤقت (6 ساعات)'
+                                t_type = 'TIMED'; t_sec = 6 * 3600; t_hrs = 6; tier_lbl = '⏱️ تصريح مؤقت (6 ساعات)'
                             elif tier_key == '10h':
-                                t_type = 'TIMED'
-                                t_hrs = 10
-                                tier_lbl = '⏱️ تصريح مؤقت (10 ساعات)'
+                                t_type = 'TIMED'; t_sec = 10 * 3600; t_hrs = 10; tier_lbl = '⏱️ تصريح مؤقت (10 ساعات)'
+                            elif tier_key == '12h':
+                                t_type = 'TIMED'; t_sec = 12 * 3600; t_hrs = 12; tier_lbl = '⏱️ تصريح مؤقت (12 ساعة)'
                             elif tier_key == '24h':
-                                t_type = 'TIMED'
-                                t_hrs = 24
-                                tier_lbl = '🌙 تصريح مؤقت (24 ساعة)'
+                                t_type = 'TIMED'; t_sec = 24 * 3600; t_hrs = 24; tier_lbl = '🌙 تصريح مؤقت (24 ساعة)'
 
-                            tok_entry = generate_new_token(creator_chat_id=chat_id, token_type=t_type, access_duration_hours=t_hrs, duration_seconds=600)
+                            tok_entry = generate_new_token(creator_chat_id=chat_id, token_type=t_type, access_duration_seconds=t_sec, access_duration_hours=t_hrs, duration_label=tier_lbl, duration_seconds=600)
                             code_str = tok_entry['token']
                             exp_str = time.strftime('%I:%M:%S %p', time.localtime(tok_entry['expires_at']))
                             deep_link = f"https://t.me/IMoayadNova_bot?start={code_str}"
@@ -1591,26 +1608,85 @@ def keymaster_bot_worker():
                             )
                             reply_markup = keymaster_dock
 
+                        elif any(cmd_clean.startswith(pfx) for pfx in ['/gen ', '/token ', 'توليد ']):
+                            raw_args = cmd_clean.split(maxsplit=1)[1].strip()
+                            m_match = re.search(r'(\d+)\s*(m|min|دقيقة|دقايق|دقائق)', raw_args)
+                            h_match = re.search(r'(\d+)\s*(h|hr|hour|ساعة|ساعات)', raw_args)
+                            c_sec = None
+                            c_lbl = '⏱️ تصريح مؤقت مخصص'
+                            if m_match:
+                                m_cnt = int(m_match.group(1))
+                                c_sec = m_cnt * 60
+                                c_lbl = f"⚡ تصريح مؤقت ({m_cnt} دقيقة)"
+                            elif h_match:
+                                h_cnt = int(h_match.group(1))
+                                c_sec = h_cnt * 3600
+                                c_lbl = f"⏱️ تصريح مؤقت ({h_cnt} ساعة)"
+                            elif raw_args in ['perm', 'دائم', 'vip']:
+                                c_sec = None
+                                c_lbl = '👑 تفعيل دائم مدى الحياة'
+                            elif raw_args.isdigit():
+                                n_val = int(raw_args)
+                                if n_val <= 60:
+                                    c_sec = n_val * 60
+                                    c_lbl = f"⚡ تصريح مؤقت ({n_val} دقيقة)"
+                                else:
+                                    c_sec = n_val * 3600
+                                    c_lbl = f"⏱️ تصريح مؤقت ({n_val} ساعة)"
+                            
+                            c_type = 'PERMANENT' if 'دائم' in c_lbl else 'TIMED'
+                            tok_entry = generate_new_token(creator_chat_id=chat_id, token_type=c_type, access_duration_seconds=c_sec, duration_label=c_lbl, duration_seconds=600)
+                            code_str = tok_entry['token']
+                            exp_str = time.strftime('%I:%M:%S %p', time.localtime(tok_entry['expires_at']))
+                            deep_link = f"https://t.me/IMoayadNova_bot?start={code_str}"
+                            reply = (
+                                "🔑 *تم إصدار توكن تفعيل جديد بنجاح!* ✅\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🎟️ *رمز التوكن (اضغط للنسخ بلمسة واحدة 📲):*\n"
+                                f"`{code_str}`\n\n"
+                                f"⏱️ *صلاحية استخدام الكود:* `10 دقائق فقط` (ينتهي: `{exp_str}`)\n"
+                                f"🛡️ *نوع التصريح للمستخدم:* *{c_lbl}*\n"
+                                "🔒 *الاستخدام:* لمرة واحدة فقط (Single-Use)\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                "🚀 *رابط التفعيل السريع بنقرة واحدة (أرسله للمستخدم):*\n"
+                                f"{deep_link}\n\n"
+                                "💡 _(بمجرد أن يضغط المستخدم على الرابط، يفتح له البوت الرئيسي مفعل تلقائياً دون كتابة أي شيء!)_"
+                            )
+                            reply_markup = {
+                                'inline_keyboard': [
+                                    [{'text': f"📋 نسخ كود التوكن: {code_str}", 'callback_data': f"copy_{code_str}"}],
+                                    [{'text': '🚀 تجربة فتح الرابط في البوت الرئيسي', 'url': deep_link}],
+                                    [{'text': '🗑️ حرق وإلغاء هذا التوكن', 'callback_data': f"burn_tok_{code_str}"}]
+                                ]
+                            }
+
                         elif cmd_clean in ['🎟️ توليد توكن تفعيل جديد (10 دقائق)', '🎟️ توليد توكن تفعيل جديد', '/new', '/gen', '/token', 'توليد', 'توكن']:
                             reply = (
                                 "🎟️ *توليد توكن تفعيل جديد (صلاحية الكود: 10 دقائق)*\n"
                                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                                 "👇 *حدد نوع تصريح الاستخدام الذي ترغب بمنحه للمستخدم:*\n\n"
-                                "👑 *تفعيل دائم (VIP):* يبقى حسابه مفعلاً للأبد دون انتهاء.\n"
-                                "⏱️ *تصريح مؤقت (1 - 24 ساعة):* تنتهي صلاحية وصوله بعد انقضاء الساعات المحددة، ويُطلب منه توكن جديد."
+                                "👑 *تفعيل دائم (VIP):* وصول كامل للأبد دون انتهاء.\n"
+                                "⚡ *تصريح بالدقائق:* 15، 30، أو 45 دقيقة للتجربة السريعة.\n"
+                                "⏱️ *تصريح بالساعات:* من 1 ساعة حتى 24 ساعة كاملة.\n"
+                                "✍️ _(يمكنك أيضاً كتابة أي مدة مباشرة مثل: `/gen 10m` أو `/gen 4h`)_"
                             )
                             reply_markup = {
                                 'inline_keyboard': [
-                                    [{'text': '👑 1. تفعيل دائم مدى الحياة', 'callback_data': 'gen_tier_perm'}],
+                                    [{'text': '👑 1. تفعيل دائم مدى الحياة (VIP)', 'callback_data': 'gen_tier_perm'}],
                                     [
-                                        {'text': '⏱️ 2. تصريح 1 ساعة', 'callback_data': 'gen_tier_1h'},
-                                        {'text': '⏱️ 3. تصريح 3 ساعات', 'callback_data': 'gen_tier_3h'}
+                                        {'text': '⚡ 15 دقيقة', 'callback_data': 'gen_tier_15m'},
+                                        {'text': '⚡ 30 دقيقة', 'callback_data': 'gen_tier_30m'},
+                                        {'text': '⚡ 45 دقيقة', 'callback_data': 'gen_tier_45m'}
                                     ],
                                     [
-                                        {'text': '⏱️ 4. تصريح 6 ساعات', 'callback_data': 'gen_tier_6h'},
-                                        {'text': '⏱️ 5. تصريح 10 ساعات', 'callback_data': 'gen_tier_10h'}
+                                        {'text': '⏱️ 1 ساعة', 'callback_data': 'gen_tier_1h'},
+                                        {'text': '⏱️ 3 ساعات', 'callback_data': 'gen_tier_3h'},
+                                        {'text': '⏱️ 6 ساعات', 'callback_data': 'gen_tier_6h'}
                                     ],
-                                    [{'text': '🌙 6. تصريح 24 ساعة (يوم كامل)', 'callback_data': 'gen_tier_24h'}]
+                                    [
+                                        {'text': '⏱️ 12 ساعة', 'callback_data': 'gen_tier_12h'},
+                                        {'text': '🌙 24 ساعة (يوم كامل)', 'callback_data': 'gen_tier_24h'}
+                                    ]
                                 ]
                             }
                         elif cmd_clean in ['⏳ التوكنات النشطة المتبقية', '/active', 'نشط', 'النشطة']:
